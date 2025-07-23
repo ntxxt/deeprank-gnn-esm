@@ -1,11 +1,12 @@
 # Command line interface for predicting fnat
 import logging
-import multiprocessing as mp
 import os
 import shutil
 import re
+import requests
 import tempfile
 import warnings
+import hashlib
 from io import TextIOWrapper
 from pathlib import Path
 import importlib.util
@@ -42,6 +43,11 @@ log.addHandler(ch)
 
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
+EXPECTED_CHECKSUMS = [
+    "ea9d0522b335a8778dea6535a65301f10208dece28cd5865482b0b1fc446168c",  # model.pt
+    "8ffe6edbd4173dc8d45c2cd5cb27d43aad77ec26b4c768200c58ae1f96693575",  # regression.pt
+]
+
 
 spec = importlib.util.find_spec("deeprank_gnn")
 if spec and spec.origin:
@@ -139,10 +145,66 @@ def pdb_to_fasta(pdb_file_path: Path, main_fasta_fh: TextIOWrapper) -> None:
         main_fasta_fh.write(f">{root}.{chain.id}\n{sequence}\n")
 
 
+def calculate_checksum(file_path, algo="sha256") -> str:
+    h = hashlib.new(algo)
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_weights(url: str, dest_path: str) -> str:
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+            raise RuntimeError(
+                f"Downloaded file does not exist or is empty: {dest_path}"
+            )
+        return dest_path
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to download weights from {url}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error when trying to download the weights: {e}")
+
+
+def fetch_weights() -> str:
+    """Fetch the ESM model weights and regression weights."""
+    models = [
+        (
+            "WEIGHT_PATH",
+            f"{ESM_MODEL}.pt",
+            f"https://dl.fbaipublicfiles.com/fair-esm/models/{ESM_MODEL}.pt",
+            "ea9d0522b335a8778dea6535a65301f10208dece28cd5865482b0b1fc446168c",
+        ),
+        (
+            "REG_WEIGHT_PATH",
+            f"{ESM_MODEL}-contact-regression.pt",
+            f"https://dl.fbaipublicfiles.com/fair-esm/regression/{ESM_MODEL}-contact-regression.pt",
+            "8ffe6edbd4173dc8d45c2cd5cb27d43aad77ec26b4c768200c58ae1f96693575",
+        ),
+    ]
+
+    for env_var, filename, url, expected_checksum in models:
+        path = os.getenv(env_var)
+        if not path:  # catches None or empty string
+            path = filename
+
+        if not os.path.exists(path):
+            download_weights(url, path)
+
+        observed_checksum = calculate_checksum(path)
+        if observed_checksum != expected_checksum:
+            download_weights(url, path)
+
+    return f"{ESM_MODEL}.pt"
+
+
 # Helper function to process each batch
-def process_batch(
-    labels, strs, output_dir, representations
-):
+def process_batch(labels, strs, output_dir, representations):
     embedd_path = []
     for i, label in enumerate(labels):
         result = {"label": label}
@@ -183,7 +245,8 @@ def get_embedding(fasta_file: Path, output_dir: Path) -> List[Path]:
     log.info("#" * 80)
 
     # Load model and alphabet
-    model, alphabet = pretrained.load_model_and_alphabet(ESM_MODEL)
+    esm_path = fetch_weights()
+    model, alphabet = pretrained.load_model_and_alphabet(esm_path)
     model.eval()
     if torch.cuda.is_available():
         model = model.cuda()
@@ -216,12 +279,7 @@ def get_embedding(fasta_file: Path, output_dir: Path) -> List[Path]:
 
             # Process the batch
             embedd_path.extend(
-                process_batch(
-                    labels,
-                    strs,
-                    output_dir,
-                    representations,
-                )
+                process_batch(labels, strs, output_dir, representations,)
             )
 
     log.info("#" * 80)
@@ -343,6 +401,7 @@ def split_input_pdb(pdb_file: Path) -> list[Path]:
     log.info(f"Processed {len(saved_files)} model(s) from {pdb_file.name}")
     return saved_files
 
+
 def main():
     """Main function."""
 
@@ -350,9 +409,7 @@ def main():
     parser.add_argument("pdb_file", help="Path to the PDB file.")
     parser.add_argument("chain_id_1", help="First chain ID.")
     parser.add_argument("chain_id_2", help="Second chain ID.")
-    parser.add_argument(
-        "num_cores", type=int, help="Number of cores to use"
-    )
+    parser.add_argument("num_cores", type=int, help="Number of cores to use")
     args = parser.parse_args()
 
     pdb_file = args.pdb_file
@@ -401,7 +458,9 @@ def main():
         pdb_path=pdb_file.parent, workspace_path=workspace_path, nproc=num_cores
     )
     ## Predict fnat
-    csv_output = predict(input_info=graph, workspace_path=workspace_path, ncores=num_cores)
+    csv_output = predict(
+        input_info=graph, workspace_path=workspace_path, ncores=num_cores
+    )
 
     ## Present the results
     parse_output(
